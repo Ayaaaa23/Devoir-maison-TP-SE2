@@ -1,0 +1,243 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>   // pour usleep()
+#include <time.h>
+
+// Définition du nombre de trajets que chaque bus doit effectuer (aller-retour)
+#define NUM_TRIPS 10
+
+// Définition du nombre de bus pour chaque ville
+#define NUM_BUSES_X 5
+#define NUM_BUSES_Y 4
+
+// Définition des deux sens possibles dans le tunnel
+#define X_TO_Y 0  // Sens de la ville X vers Y
+#define Y_TO_X 1  // Sens de la ville Y vers X
+
+// --- Variables de synchronisation globales ---
+
+// Mutex pour protéger l'accès aux variables partagées (section critique)
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Sémaphores pour faire attendre les bus selon leur direction s'ils ne peuvent pas entrer
+sem_t sem_x;  // Pour les bus allant de X vers Y (ou pour l'attente liée à ce sens)
+sem_t sem_y;  // Pour les bus allant de Y vers X
+
+// --- Variables globales de gestion du tunnel ---
+
+// current_direction indique le sens d'occupation du tunnel:
+// -1 signifie tunnel libre, 0 signifie que le tunnel est occupé par des bus allant de X vers Y, 
+// 1 signifie qu'il est occupé par des bus allant de Y vers X
+int current_direction = -1;
+
+// Nombre de bus actuellement en train de traverser le tunnel
+int buses_in_tunnel = 0;
+
+// Compteurs pour le nombre de bus en attente pour chaque sens
+int waiting_x = 0;  // Bus en attente pour aller de X vers Y
+int waiting_y = 0;  // Bus en attente pour aller de Y vers X
+
+// -------------------------------------------------------------------
+// Fonction : acquire_tunnel
+// Objectif : permettre à un bus d'entrer dans le tunnel en respectant
+//            les règles de circulation (pas de croisement, équité, etc.)
+// Paramètre : direction  (X_TO_Y ou Y_TO_X)
+// -------------------------------------------------------------------
+void acquire_tunnel(int direction) {
+    // On verrouille le mutex pour accéder en exclusivité aux variables partagées
+    pthread_mutex_lock(&mutex);
+
+    // Si aucun bus n'est dans le tunnel
+    if (buses_in_tunnel == 0) {
+        // Même si le tunnel est libre, on vérifie si l'autre sens a des bus en attente.
+        // Si c'est le cas, le bus doit attendre pour garantir l'équité.
+        if ((direction == X_TO_Y && waiting_y > 0) ||
+            (direction == Y_TO_X && waiting_x > 0)) {
+            if (direction == X_TO_Y) {
+                waiting_x++;             // Incrémente le compteur des bus X->Y en attente
+                pthread_mutex_unlock(&mutex);  
+                sem_wait(&sem_x);        // Le bus bloque ici jusqu'à ce qu'il soit autorisé
+                pthread_mutex_lock(&mutex);  
+                waiting_x--;             // Le bus n'est plus en attente
+            } else { // Pour Y_TO_X
+                waiting_y++;
+                pthread_mutex_unlock(&mutex);
+                sem_wait(&sem_y);
+                pthread_mutex_lock(&mutex);
+                waiting_y--;
+            }
+        }
+        // Maintenant, le tunnel est libre et aucune attente prioritaire n'est détectée:
+        current_direction = direction;  // On définit le sens actuel du tunnel
+        buses_in_tunnel++;              // Le bus entre dans le tunnel..
+        pthread_mutex_unlock(&mutex);   // ..et on libère le mutex.
+    }
+    // Sinon, si le tunnel est déjà occupé par des bus allant dans le même sens:
+    else if (current_direction == direction) {
+        // Le bus peut rejoindre le groupe déjà présent
+        buses_in_tunnel++;
+        pthread_mutex_unlock(&mutex);
+    }
+    // Sinon, le tunnel est occupé par des bus allant dans le sens opposé:
+    else {
+        if (direction == X_TO_Y) {
+            waiting_x++;             // Incrémente l'attente pour X->Y
+            pthread_mutex_unlock(&mutex);
+            sem_wait(&sem_x);        // Le bus attend son tour pour passer
+            pthread_mutex_lock(&mutex);
+            waiting_x--;             // Une fois réveillé, décrémente le compteur d'attente
+            buses_in_tunnel++;       // Puis, le bus entre dans le tunnel
+            pthread_mutex_unlock(&mutex);
+        } else { // Cas pour Y_TO_X
+            waiting_y++;             
+            pthread_mutex_unlock(&mutex);
+            sem_wait(&sem_y);        
+            pthread_mutex_lock(&mutex);
+            waiting_y--;
+            buses_in_tunnel++;
+            pthread_mutex_unlock(&mutex);
+        }
+    }
+}
+
+// -------------------------------------------------------------------
+// Fonction : release_tunnel
+// Objectif : libérer le tunnel quand un bus a fini de traverser, et
+//           donner l'accès aux bus dans la direction opposée (le cas échéant)
+// Paramètre : direction  (le sens dans lequel le bus venait de circuler)
+// -------------------------------------------------------------------
+void release_tunnel(int direction) {
+    pthread_mutex_lock(&mutex);
+    buses_in_tunnel--;  // Le bus quitte le tunnel
+
+    // Si le tunnel vient d'être libéré (aucun bus à l'intérieur)
+    if (buses_in_tunnel == 0) {
+        // Si le tunnel était occupé par des bus X->Y et qu'il y a des bus de Y->X en attente:
+        if (direction == X_TO_Y && waiting_y > 0) {
+            current_direction = Y_TO_X;  // Changement de direction pour accueillir le sens opposé
+            int count = waiting_y;         // Nombre de bus qui attendent
+            for (int i = 0; i < count; i++) {
+                sem_post(&sem_y);          // Réveille chacun d'eux
+            }
+        }
+        // Si le tunnel était occupé par des bus Y->X et qu'il y a des bus de X->Y en attente:
+        else if (direction == Y_TO_X && waiting_x > 0) {
+            current_direction = X_TO_Y;
+            int count = waiting_x;
+            for (int i = 0; i < count; i++) {
+                sem_post(&sem_x);
+            }
+        }
+        // Si aucun bus n'attend dans l'autre sens, le tunnel devient libre
+        else {
+            current_direction = -1;
+        }
+    }
+    pthread_mutex_unlock(&mutex);
+}
+
+// -------------------------------------------------------------------
+// Fonction : bus_thread
+// Objectif : modéliser le comportement d'un bus qui effectue
+//            NUM_TRIPS trajets aller-retour dans le tunnel.
+// Paramètre : arg, un pointeur vers un tableau de deux entiers :
+//             {bus_id, direction de départ}
+// -------------------------------------------------------------------
+void* bus_thread(void* arg) {
+    int* params = (int*)arg;
+    int bus_id = params[0];          // Identifiant unique du bus
+    int start_direction = params[1]; // Direction initiale : X_TO_Y ou Y_TO_X
+
+    // Définition des villes en fonction de la direction initiale
+    const char* ville_depart = (start_direction == X_TO_Y) ? "X" : "Y";
+    const char* ville_arrivee = (start_direction == X_TO_Y) ? "Y" : "X";
+
+    // Boucle des trajets aller-retour
+    for (int i = 1; i <= NUM_TRIPS; i++) {
+        // ---- Trajet Aller ----
+        // Tenter d'entrer dans le tunnel en respectant le sens de départ
+        acquire_tunnel(start_direction);
+        // Afficher le trajet pour le suivi
+        printf("Bus %d de %s : %s -> %s (Trajet %d)\n", bus_id, ville_depart, ville_depart, ville_arrivee, i);
+        // Simuler la traversée du tunnel avec un délai aléatoire entre 1 et 1,5 secondes
+        usleep(1000000 + rand() % 500000);
+        // Libérer le tunnel après le trajet aller
+        release_tunnel(start_direction);
+
+        // ---- Trajet Retour ----
+        // Calculer la direction opposée
+        int reverse_direction = (start_direction == X_TO_Y) ? Y_TO_X : X_TO_Y;
+        // Tenter d'entrer dans le tunnel pour le trajet retour
+        acquire_tunnel(reverse_direction);
+        // Afficher le trajet retour
+        printf("Bus %d de %s : %s -> %s (Trajet %d)\n", bus_id, ville_arrivee, ville_arrivee, ville_depart, i);
+        // Simuler la traversée du tunnel avec un délai aléatoire entre 1 et 1,5 secondes
+        usleep(1000000 + rand() % 500000);
+        // Libérer le tunnel après le trajet retour
+        release_tunnel(reverse_direction);
+
+        // Petite pause simulant éventuellement l'attente au dépôt
+        usleep(100000);
+    }
+    // Libération de la mémoire allouée aux paramètres
+    free(arg);
+    return NULL;
+}
+
+// -------------------------------------------------------------------
+// Fonction principale
+// Objectif : initialiser la simulation, créer les threads pour chaque bus,
+//            attendre leur terminaison et effectuer le nettoyage final.
+// -------------------------------------------------------------------
+int main() {
+    // Initialiser la graine du générateur de nombres aléatoires
+    srand(time(NULL));
+
+    // Initialisation des sémaphores pour les bus en attente (valeur initiale 0)
+    sem_init(&sem_x, 0, 0);
+    sem_init(&sem_y, 0, 0);
+
+    // Calculer le nombre total de bus (de X et de Y)
+    int total_buses = NUM_BUSES_X + NUM_BUSES_Y;
+    pthread_t threads[total_buses];  // Tableau pour stocker les identifiants de threads
+    int thread_count = 0;
+
+    // Création des threads pour les bus de la ville X, avec direction X -> Y
+    for (int i = 0; i < NUM_BUSES_X; i++) {
+        // Allouer dynamiquement un tableau de 2 entiers pour passer les paramètres au thread
+        int* param = malloc(2 * sizeof(int));
+        if (!param) {
+            perror("malloc");
+            exit(EXIT_FAILURE);
+        }
+        param[0] = i;         // Identifiant du bus
+        param[1] = X_TO_Y;    // Spécifie que le bus commence par aller de X vers Y
+        pthread_create(&threads[thread_count++], NULL, bus_thread, param);
+    }
+
+    // Création des threads pour les bus de la ville Y, avec direction Y -> X
+    for (int i = 0; i < NUM_BUSES_Y; i++) {
+        int* param = malloc(2 * sizeof(int));
+        if (!param) {
+            perror("malloc");
+            exit(EXIT_FAILURE);
+        }
+        param[0] = i;         // Identifiant du bus (indépendant de ceux de la ville X)
+        param[1] = Y_TO_X;    // Spécifie que le bus commence par aller de Y vers X
+        pthread_create(&threads[thread_count++], NULL, bus_thread, param);
+    }
+
+    // Attendre que tous les threads se terminent (chaque bus a terminé ses trajets)
+    for (int i = 0; i < total_buses; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    // Nettoyage final : destruction des sémaphores et du mutex
+    sem_destroy(&sem_x);
+    sem_destroy(&sem_y);
+    pthread_mutex_destroy(&mutex);
+
+    return 0;
+}
